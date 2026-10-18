@@ -21,6 +21,7 @@ _PROFILE_REASONS = {
 
 
 def tier_for(score: int) -> int:
+    """Map a score to its tier: 60+ is Tier 1, 40 to 59 Tier 2, else Tier 3."""
     if score >= 60:
         return 1
     if score >= 40:
@@ -29,7 +30,13 @@ def tier_for(score: int) -> int:
 
 
 def score_lead(lead) -> tuple:
-    """Return (score, tier, reasons) and update the lead in place."""
+    """Score one lead and update it in place.
+
+    Returns ``(score, tier, reasons)``. Points are additive (see the
+    table in README.md), capped at 100, and each contribution appends
+    a human-readable reason, so a score is always explainable from
+    its reasons. Unknown fields contribute zero and add no reason.
+    """
     points = 0
     reasons = []
 

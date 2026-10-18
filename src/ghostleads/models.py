@@ -7,6 +7,7 @@ treated as a known gap or filled with a guess.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import asdict, dataclass, field
 
 WEBSITE_STATUSES = ("live", "dead", "template", "none", "unknown")
@@ -17,13 +18,34 @@ _FALSE = {"false", "no", "n", "0", "f"}
 
 
 def _clean(value) -> str:
+    """Return ``value`` as a single-line string (``""`` for ``None``).
+
+    Every imported text field passes through here, so the rest of
+    the package can assume single-line values with single spaces.
+    """
     if value is None:
         return ""
+    if isinstance(value, (list, dict, tuple, set)):
+        # A nested JSON value is never a single-line field: stringifying
+        # it would store a Python repr (for example "['Foo', 'Bar']")
+        # as a business name or phone and print it in a pack as if it
+        # were researched data. Reject it so the row is skipped (or a
+        # corrupt store fails cleanly) instead.
+        raise ValueError(f"field value is not a single value: {value!r}")
+    # Drop C0/DEL control characters other than whitespace (a NUL byte
+    # in a CSV cell otherwise survives into the store and the pack).
+    s = re.sub(r"[\x00-\x08\x0e-\x1f\x7f]", "", str(value))
     # Collapse every whitespace run, newlines included: imported
     # fields are single-line values, and a quoted CSV newline must
     # not be able to inject lines (for example fake markdown
     # headings) into a generated pack.
-    return " ".join(str(value).split())
+    return " ".join(s.split())
+
+
+def _fold_ascii(s: str) -> str:
+    """Fold accented letters to their ASCII base (é -> e, ñ -> n) so
+    directory spelling variants of the same name or town line up."""
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
 
 
 def parse_bool(value):
@@ -56,6 +78,13 @@ def parse_rating(value):
 
 
 def normalise_website_status(value) -> str:
+    """Normalise a website_status value to a member of WEBSITE_STATUSES.
+
+    Accepts the documented values plus common source spellings
+    (``404`` for dead, ``business.site`` for template, and similar).
+    Blank means ``"unknown"``. Any other value raises ValueError so
+    the row is skipped with a reason instead of scored silently.
+    """
     s = _clean(value).lower().replace("_", "-").replace(" ", "-")
     if not s:
         return "unknown"
@@ -74,6 +103,12 @@ def normalise_website_status(value) -> str:
 
 
 def normalise_google_profile(value) -> str:
+    """Normalise a google_profile value to a member of GOOGLE_PROFILES.
+
+    Accepts the documented values plus common aliases (``gbp`` for
+    listing-only, ``verified`` for claimed, and similar). Blank
+    means ``"unknown"``. Any other value raises ValueError.
+    """
     s = _clean(value).lower().replace("_", "-").replace(" ", "-")
     if not s:
         return "unknown"
@@ -93,7 +128,19 @@ def normalise_google_profile(value) -> str:
 
 
 def phone_digits(value) -> str:
-    digits = re.sub(r"\D", "", _clean(value))
+    """Return only the digits of a phone value, for dedupe comparison.
+
+    Formatting is ignored, a trailing extension (``ext. 12`` / ``x12``)
+    is stripped, and a leading US country code ``1`` on an
+    11-digit number is stripped, so differently formatted listings
+    of the same number compare equal. Blank input returns ``""``.
+    """
+    s = _clean(value).lower()
+    # A trailing extension ("423-555-0100 ext. 12", "... x12") is
+    # switchboard routing, not part of the number: the same line
+    # listed with and without one must dedupe together.
+    s = re.sub(r"(?:ext\.?|extension|x)\s*\d+\s*$", "", s)
+    digits = re.sub(r"\D", "", s)
     # Directory listings often carry the US country code: 1-865-555-0100
     # and (865) 555-0100 are the same number and must dedupe together.
     if len(digits) == 11 and digits.startswith("1"):
@@ -102,7 +149,18 @@ def phone_digits(value) -> str:
 
 
 def normalise_name(value) -> str:
-    s = _clean(value).lower()
+    """Return a comparison form of a business name for dedupe.
+
+    Lowercases, folds accented letters to ASCII, reads ``&`` as
+    "and", drops apostrophes and other punctuation, and strips
+    common suffix words (llc, inc, co, the), so directory spelling
+    variants of one business compare equal. This function itself is
+    not fuzzy: a one-letter spelling difference still produces a
+    different name here; near-spelling matching lives in
+    ``fuzzy_name_match`` and merges only with corroboration in
+    ``store.same_lead``.
+    """
+    s = _fold_ascii(_clean(value).lower())
     # "&" and "and" are the same word in directory variants
     # (C & C Ready Mix vs C and C Ready Mix), and an apostrophe is
     # not a letter boundary (Buck's vs Bucks).
@@ -113,8 +171,90 @@ def normalise_name(value) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def normalise_town(value) -> str:
+    """Comparison key for towns: case, accents, and punctuation are
+    directory formatting ("Exampleton," vs "Exampleton",
+    "St. Marys" vs "St Marys"), not different places."""
+    s = _fold_ascii(_clean(value).lower())
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def edit_distance(a: str, b: str) -> int:
+    """Optimal string alignment distance between two strings.
+
+    Levenshtein distance plus one extra edit: swapping two adjacent
+    characters costs 1, so a transposed-letter typo ("Johnosn" for
+    "Johnson") counts as a single slip, not two. Pure stdlib DP over
+    the two words; lead names are short, so no bounding is needed.
+    """
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev2 = None
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            cur[j] = min(prev[j] + 1,          # deletion
+                         cur[j - 1] + 1,      # insertion
+                         prev[j - 1] + cost)  # substitution / match
+            if prev2 is not None and j > 1 \
+                    and ca == b[j - 2] and a[i - 2] == cb:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)  # transposition
+        prev2, prev = prev, cur
+    return prev[len(b)]
+
+
+def fuzzy_name_match(a, b) -> bool:
+    """True when two names are near-spelling variants, not identical.
+
+    Directory listings mistype the same business ("Dautel" in one,
+    "Dautell" in another, the standing example in PLAN.md), and the
+    exact normalised match misses those. This predicate is kept
+    deliberately narrow so it cannot swallow distinct businesses:
+
+    - both names must normalise to the same number of words;
+    - exactly one word may differ, and it must keep its first letter;
+    - the differing word must be at least 4 letters long, and within
+      edit distance 1, or distance 2 when the shorter word has at
+      least 7 letters (room for two slips in a long name only);
+    - identical normalised names return False: that is the exact
+      match, handled by the caller with its own, looser rules.
+
+    A True result is only ever a *candidate* match. store.same_lead
+    additionally requires corroboration from other known fields
+    before two records actually merge.
+    """
+    tokens_a = normalise_name(a).split()
+    tokens_b = normalise_name(b).split()
+    if not tokens_a or len(tokens_a) != len(tokens_b):
+        return False
+    differing = [(x, y) for x, y in zip(tokens_a, tokens_b) if x != y]
+    if len(differing) != 1:
+        return False
+    x, y = differing[0]
+    if x[0] != y[0] or min(len(x), len(y)) < 4:
+        return False
+    limit = 2 if min(len(x), len(y)) >= 7 else 1
+    return edit_distance(x, y) <= limit
+
+
 @dataclass
 class Lead:
+    """One stored lead: imported fields plus its score state.
+
+    Only ``name`` is required. Every other field defaults to blank
+    or unknown (``has_website`` and ``rating`` default to ``None``),
+    and unknown is a real state throughout the tool: it scores zero,
+    shows as ``(blank)`` in a pack, and is never filled with a guess.
+    ``score``, ``tier``, and ``reasons`` are written by the scorer.
+    """
+
     name: str
     trade: str = ""
     town: str = ""
@@ -156,11 +296,17 @@ class Lead:
         return lead
 
     def dedupe_key(self) -> tuple:
+        """Return this lead's simple (name, phone-or-town) key.
+
+        Kept for compatibility and inspection. Actual import merging
+        uses ``store.same_lead``, whose predicate also covers the
+        mixed case where only one of two records carries a phone.
+        """
         name = normalise_name(self.name)
         digits = phone_digits(self.phone)
         if digits:
             return (name, digits)
-        return (name, _clean(self.town).lower())
+        return (name, normalise_town(self.town))
 
     def fill_blanks_from(self, other: "Lead") -> bool:
         """Fill blank/unknown fields from other. Never overwrite a
@@ -218,10 +364,20 @@ class Lead:
             out["rating"] = parse_rating(out["rating"])
         for attr in ("score", "tier"):
             if attr in out:
+                if isinstance(out[attr], bool):
+                    # JSON true/false is not a score: int(True) would
+                    # silently store score 1 / tier 0 (an invalid tier).
+                    out[attr] = 0 if attr == "score" else 3
+                    continue
                 try:
                     out[attr] = int(out[attr])
                 except (TypeError, ValueError):
                     out[attr] = 0 if attr == "score" else 3
-        if "reasons" in out and not isinstance(out["reasons"], list):
-            out["reasons"] = []
+        if "reasons" in out:
+            if not isinstance(out["reasons"], list):
+                out["reasons"] = []
+            else:
+                # Reasons are printed verbatim in packs: keep them
+                # single-line plain text, never raw stored objects.
+                out["reasons"] = [_clean(str(r)) for r in out["reasons"]]
         return cls(**out)

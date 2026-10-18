@@ -20,6 +20,13 @@ STUDIO_CONTACT = "(423) 408-2150"  # Ryan's public TextNow number, studio contac
 
 
 def slugify(name: str) -> str:
+    """Return a file-safe slug for a business name.
+
+    Example: ``"Hilltop Quarry Hauling"`` becomes
+    ``"hilltop-quarry-hauling"``. Used for pack file names and for
+    matching ``pack --lead`` against a typed slug. An all-punctuation
+    name falls back to ``"lead"``.
+    """
     s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     return s or "lead"
 
@@ -94,7 +101,13 @@ def _draft_pitch(lead) -> list:
 
 
 def build_pack(lead) -> str:
-    """Return the full markdown pack for one lead."""
+    """Return the full markdown pack for one lead.
+
+    Section order is fixed: draft banner, lead snapshot, score with
+    reasons, suggested angle, draft pitch, verification checklist,
+    and a closing draft-only line. See the README section "What is
+    in a pack" for what a reader should expect in each section.
+    """
     rating_text = "(blank)" if lead.rating is None else f"{lead.rating:g}"
     website_text = "(blank)" if lead.has_website is None else ("yes" if lead.has_website else "no")
     lines = []
