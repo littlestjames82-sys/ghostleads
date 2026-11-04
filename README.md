@@ -1,5 +1,6 @@
 # GhostLeads
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/littlestjames82-sys/ghostleads/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/ghostleads/actions/workflows/ci.yml/actions)
 
 **Score the local business leads you already found, and draft a pitch pack for the best ones. All on your own computer.**
 
